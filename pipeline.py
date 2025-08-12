@@ -142,5 +142,123 @@ def log_experiment(payload: Dict[str, Any], log_file: Path = ARTIFACTS_DIR / 'ex
 
 __all__ = [
     'clean_text', 'add_basic_nlp_features', 'load_training_dataframe', 'build_vectorizer',
-    'train_logreg', 'evaluate', 'run_pipeline', 'log_experiment'
+    'train_logreg', 'evaluate', 'run_pipeline', 'log_experiment',
+    'train_task1_model', 'predict_task1', 'load_artifacts'
 ]
+
+# ---------- Task 1 Convenience (binary classification on 'flausch') ----------
+
+def train_task1_model(max_features: int = 5000, force_rebuild: bool = False, grid_search: bool = False):
+    """Train a model for Task 1 (assumes target column 'flausch').
+
+    Parameters
+    ----------
+    max_features : int
+        Max TF-IDF features.
+    force_rebuild : bool
+        Force rebuild of cached training dataframe.
+    grid_search : bool
+        Whether to run a small param grid over C values for LogisticRegression.
+
+    Returns
+    -------
+    dict with keys: model, vectorizer, metrics, target_col
+    """
+    df = load_training_dataframe(force_rebuild=force_rebuild)
+    if 'flausch' not in df.columns:
+        raise ValueError("Expected column 'flausch' in training data.")
+    df = df.dropna(subset=['flausch'])
+    # Ensure no NaN text rows remain
+    df = df[df['clean_comment'].notna()].copy()
+    X = df['clean_comment'].fillna('')
+    y = df['flausch'].astype(str)
+    X_tr, X_va, y_tr, y_va = train_test_split(X, y, stratify=y, test_size=0.2, random_state=RANDOM_SEED)
+    vec = build_vectorizer(max_features=max_features)
+    X_tr_vec = vec.fit_transform(X_tr)
+    X_va_vec = vec.transform(X_va)
+    base_model = LogisticRegression(max_iter=1000, class_weight='balanced')
+    model = base_model
+    if grid_search:
+        from sklearn.model_selection import GridSearchCV
+        param_grid = {'C': [0.1, 1.0, 3.0]}
+        gs = GridSearchCV(base_model, param_grid, scoring='f1_macro', cv=3, n_jobs=-1)
+        gs.fit(X_tr_vec, y_tr)
+        model = gs.best_estimator_
+    else:
+        model.fit(X_tr_vec, y_tr)
+    metrics = evaluate(model, vec, X_va, y_va)
+    # Persist artifacts
+    joblib.dump(vec, ARTIFACTS_DIR / 'tfidf_vectorizer.joblib')
+    joblib.dump(model, ARTIFACTS_DIR / 'best_model.joblib')
+    log_experiment({'task': 'task1_train', 'metrics': metrics, 'target_col': 'flausch', 'grid_search': grid_search})
+    return {'model': model, 'vectorizer': vec, 'metrics': metrics, 'target_col': 'flausch'}
+
+
+def load_artifacts():
+    """Load persisted vectorizer and model (raises FileNotFoundError if missing)."""
+    vec_path = ARTIFACTS_DIR / 'tfidf_vectorizer.joblib'
+    model_path = ARTIFACTS_DIR / 'best_model.joblib'
+    if not vec_path.exists() or not model_path.exists():
+        raise FileNotFoundError('Artifacts not found. Train a model first.')
+    vec = joblib.load(vec_path)
+    model = joblib.load(model_path)
+    return model, vec
+
+
+def predict_task1(comments: Iterable[str], model=None, vectorizer=None, auto_load: bool = True) -> pd.DataFrame:
+    """Predict Task 1 labels for a list/iterable of raw comment strings.
+
+    Parameters
+    ----------
+    comments : Iterable[str]
+        Raw comment texts.
+    model, vectorizer : optional
+        Preloaded artifacts; if None and auto_load True, they'll be loaded from disk.
+    auto_load : bool
+        Auto-load persisted artifacts if model/vectorizer not provided.
+
+    Returns
+    -------
+    DataFrame with columns: comment, clean_comment, prediction, proba (if available)
+    """
+    if model is None or vectorizer is None:
+        if not auto_load:
+            raise ValueError('Model/vectorizer not supplied and auto_load is False.')
+        model, vectorizer = load_artifacts()
+    rows = []
+    for c in comments:
+        cleaned = clean_text(c)
+        vec = vectorizer.transform([cleaned])
+        pred = model.predict(vec)[0]
+        proba = None
+        if hasattr(model, 'predict_proba'):
+            try:
+                proba = float(model.predict_proba(vec)[0,1])
+            except Exception:
+                proba = None
+        rows.append({'comment': c, 'clean_comment': cleaned, 'prediction': pred, 'proba': proba})
+    return pd.DataFrame(rows)
+
+
+def _cli():  # pragma: no cover - simple CLI helper
+    import argparse, sys
+    parser = argparse.ArgumentParser(description='Task 1 model training and prediction CLI')
+    sub = parser.add_subparsers(dest='command', required=True)
+    p_train = sub.add_parser('train', help='Train Task1 model')
+    p_train.add_argument('--max-features', type=int, default=5000)
+    p_train.add_argument('--grid', action='store_true', help='Run grid search over C')
+    p_train.add_argument('--force-rebuild', action='store_true')
+    p_pred = sub.add_parser('predict', help='Predict Task1 labels')
+    p_pred.add_argument('input', nargs='*', help='Raw comments; if empty, read from STDIN lines')
+    args = parser.parse_args()
+    if args.command == 'train':
+        out = train_task1_model(max_features=args.max_features, force_rebuild=args.force_rebuild, grid_search=args.grid)
+        print('Metrics:', out['metrics'])
+    elif args.command == 'predict':
+        texts = args.input or [l.strip() for l in sys.stdin if l.strip()]
+        df_pred = predict_task1(texts)
+        print(df_pred.to_csv(index=False))
+
+
+if __name__ == '__main__':  # pragma: no cover
+    _cli()
