@@ -143,7 +143,7 @@ def log_experiment(payload: Dict[str, Any], log_file: Path = ARTIFACTS_DIR / 'ex
 __all__ = [
     'clean_text', 'add_basic_nlp_features', 'load_training_dataframe', 'build_vectorizer',
     'train_logreg', 'evaluate', 'run_pipeline', 'log_experiment',
-    'train_task1_model', 'predict_task1', 'load_artifacts'
+    'train_task1_model', 'predict_task1', 'load_artifacts', 'predict_task1_dataset'
 ]
 
 # ---------- Task 1 Convenience (binary classification on 'flausch') ----------
@@ -240,6 +240,44 @@ def predict_task1(comments: Iterable[str], model=None, vectorizer=None, auto_loa
     return pd.DataFrame(rows)
 
 
+def predict_task1_dataset(split: str = 'training data', out_path: Optional[Path] = None, batch_size: int = 512) -> Path:
+    """Run Task1 predictions over an entire split's comments and persist results.
+
+    Parameters
+    ----------
+    split : str
+        One of the directory names under Data (e.g., 'training data').
+    out_path : Path, optional
+        Where to write the CSV (defaults to artifacts/task1_predictions_<split>.csv)
+    batch_size : int
+        Batch size (placeholder for future batching; current implementation processes all at once).
+
+    Returns
+    -------
+    Path to written CSV file.
+    """
+    split_dir = DATA_DIR / split
+    comments_path = split_dir / 'comments.csv'
+    if not comments_path.exists():
+        raise FileNotFoundError(f'Missing comments file: {comments_path}')
+    comments_df = pd.read_csv(comments_path)
+    # Ensure artifacts exist
+    try:
+        model, vec = load_artifacts()
+    except FileNotFoundError:
+        # Train first if missing
+        train_task1_model()
+        model, vec = load_artifacts()
+    preds_df = predict_task1(comments_df['comment'].tolist(), model=model, vectorizer=vec, auto_load=False)
+    merged = comments_df.join(preds_df[['prediction','proba']])
+    if out_path is None:
+        safe_split = split.replace(' ', '_')
+        out_path = ARTIFACTS_DIR / f'task1_predictions_{safe_split}.csv'
+    merged.to_csv(out_path, index=False)
+    log_experiment({'task': 'task1_batch_predict', 'rows': len(merged), 'split': split})
+    return out_path
+
+
 def _cli():  # pragma: no cover - simple CLI helper
     import argparse, sys
     parser = argparse.ArgumentParser(description='Task 1 model training and prediction CLI')
@@ -250,6 +288,9 @@ def _cli():  # pragma: no cover - simple CLI helper
     p_train.add_argument('--force-rebuild', action='store_true')
     p_pred = sub.add_parser('predict', help='Predict Task1 labels')
     p_pred.add_argument('input', nargs='*', help='Raw comments; if empty, read from STDIN lines')
+    p_pred_ds = sub.add_parser('predict-dataset', help='Predict Task1 labels for a full split and write CSV')
+    p_pred_ds.add_argument('--split', default='training data')
+    p_pred_ds.add_argument('--out', default=None, help='Output CSV path')
     args = parser.parse_args()
     if args.command == 'train':
         out = train_task1_model(max_features=args.max_features, force_rebuild=args.force_rebuild, grid_search=args.grid)
@@ -258,6 +299,9 @@ def _cli():  # pragma: no cover - simple CLI helper
         texts = args.input or [l.strip() for l in sys.stdin if l.strip()]
         df_pred = predict_task1(texts)
         print(df_pred.to_csv(index=False))
+    elif args.command == 'predict-dataset':
+        out_path = predict_task1_dataset(split=args.split, out_path=Path(args.out) if args.out else None)
+        print(f'Wrote predictions to {out_path}')
 
 
 if __name__ == '__main__':  # pragma: no cover
